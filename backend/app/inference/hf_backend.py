@@ -2,14 +2,14 @@
 
 Supports any AutoModelForCausalLM-compatible model on cuda / mps / cpu.
 Tensor capture is done via PyTorch forward hooks (see collectors/tensor_hooks.py).
+Note: token-level streaming is added in Phase 3 via WebSockets.
 """
 
-import threading
 import time
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from app.collectors.memory import get_peak_memory_mb, reset_memory_stats
 from app.collectors.tensor_hooks import TensorCaptureHook
@@ -43,6 +43,7 @@ class HFBackend(InferenceBackend):
             self.load_model(config.model_id, config.device)
 
         inputs = self._tokenizer(config.prompt, return_tensors="pt").to(self._device)
+        prompt_len = inputs["input_ids"].shape[1]
 
         # Attach tensor capture hooks if requested
         artifact_dir = Path(settings.data_dir) / "tensors"
@@ -51,57 +52,38 @@ class HFBackend(InferenceBackend):
         if config.capture_layers:
             hook.attach(self._model)
 
-        # Reset memory counters before generation
         reset_memory_stats(self._device)
-
-        # Streaming via TextIteratorStreamer (runs generate() in a thread)
-        streamer = TextIteratorStreamer(
-            self._tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True,
-        )
-
-        gen_kwargs = dict(
-            **inputs,
-            max_new_tokens=config.max_new_tokens,
-            temperature=config.temperature,
-            do_sample=config.do_sample,
-            streamer=streamer,
-        )
-
-        gen_thread = threading.Thread(target=self._model.generate, kwargs=gen_kwargs, daemon=True)
-
-        token_events: list[TokenEvent] = []
-        ttft_ms: float = 0.0
         t_start = time.perf_counter()
 
-        gen_thread.start()
-
-        step = 0
-        full_text = ""
-        for token_str in streamer:
-            elapsed_ms = (time.perf_counter() - t_start) * 1000
-            if step == 0:
-                ttft_ms = elapsed_ms
-
-            # Approximate token_id via tokenizer (streamer doesn't expose ids directly)
-            token_ids = self._tokenizer.encode(token_str, add_special_tokens=False)
-            token_id = token_ids[0] if token_ids else -1
-
-            token_events.append(TokenEvent(
-                token=token_str,
-                token_id=token_id,
-                step=step,
-                elapsed_ms=elapsed_ms,
-            ))
-            full_text += token_str
-            step += 1
-
-        gen_thread.join()
+        with torch.no_grad():
+            output_ids = self._model.generate(
+                **inputs,
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature,
+                do_sample=config.do_sample,
+            )
 
         total_latency_ms = (time.perf_counter() - t_start) * 1000
         peak_memory_mb = get_peak_memory_mb(self._device)
         tensor_artifacts = hook.detach() if config.capture_layers else {}
+
+        # Decode only the newly generated tokens (exclude prompt)
+        new_ids = output_ids[0][prompt_len:]
+        full_text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+        num_tokens = len(new_ids)
+
+        # Build per-token events with estimated elapsed time (linear interpolation)
+        token_events: list[TokenEvent] = []
+        for step, token_id in enumerate(new_ids.tolist()):
+            elapsed_ms = total_latency_ms * (step + 1) / num_tokens if num_tokens > 0 else 0
+            token_events.append(TokenEvent(
+                token=self._tokenizer.decode([token_id], skip_special_tokens=True),
+                token_id=token_id,
+                step=step,
+                elapsed_ms=elapsed_ms,
+            ))
+
+        ttft_ms = token_events[0].elapsed_ms if token_events else 0.0
 
         return GenerationResult(
             text=full_text,
@@ -110,7 +92,7 @@ class HFBackend(InferenceBackend):
             time_to_first_token_ms=ttft_ms,
             total_latency_ms=total_latency_ms,
             peak_memory_mb=peak_memory_mb,
-            num_tokens=len(token_events),
+            num_tokens=num_tokens,
         )
 
     def unload_model(self) -> None:
