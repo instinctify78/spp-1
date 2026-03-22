@@ -22,6 +22,9 @@ def create_run(payload: RunCreate, db: Session = Depends(get_db)):
 
     run_inference.delay(run.id)
 
+    # In DEV_EAGER mode the task runs synchronously above — re-fetch to get final state
+    db.expire_all()
+    run = db.query(Run).options(selectinload(Run.metrics)).filter(Run.id == run.id).first()
     return run
 
 
