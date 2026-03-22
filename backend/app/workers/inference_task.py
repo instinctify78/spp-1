@@ -19,24 +19,24 @@ logger = get_task_logger(__name__)
 class InferenceTask(Task):
     """Base task class that holds a long-lived backend to avoid repeated model loads."""
     abstract = True
-    _backend = None
+    _inference_backend = None   # named to avoid collision with Celery's Task._backend
     _loaded_model_id = None
     _loaded_device = None
 
-    def get_backend(self, backend_type: str, model_id: str, device: str):
+    def get_inference_backend(self, backend_type: str, model_id: str, device: str):
         """Return a cached backend, reloading only if model or device changed."""
         if (
-            self._backend is None
+            self._inference_backend is None
             or self._loaded_model_id != model_id
             or self._loaded_device != device
         ):
-            if self._backend is not None:
-                self._backend.unload_model()
-            self._backend = create_backend(backend_type)
-            self._backend.load_model(model_id, device)
+            if self._inference_backend is not None:
+                self._inference_backend.unload_model()
+            self._inference_backend = create_backend(backend_type)
+            self._inference_backend.load_model(model_id, device)
             self._loaded_model_id = model_id
             self._loaded_device = device
-        return self._backend
+        return self._inference_backend
 
 
 @celery_app.task(bind=True, base=InferenceTask, name="inference.run")
@@ -52,7 +52,7 @@ def run_inference(self: InferenceTask, run_id: int) -> dict:
         db.commit()
         logger.info("Starting inference for run %d: model=%s device=%s", run_id, cfg["model_id"], cfg["device"])
 
-        backend = self.get_backend(
+        backend = self.get_inference_backend(
             backend_type=cfg.get("backend_type", "huggingface"),
             model_id=cfg["model_id"],
             device=cfg["device"],
