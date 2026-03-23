@@ -24,6 +24,15 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               Runs
             </Link>
             <Link
+              to="/compare"
+              className={cn(
+                "px-3 py-1.5 rounded-md text-sm transition-colors",
+                pathname === "/compare" ? "bg-accent font-medium" : "text-muted-foreground hover:bg-accent/50",
+              )}
+            >
+              Compare
+            </Link>
+            <Link
               to="/runs/new"
               className={cn(
                 "px-3 py-1.5 rounded-md text-sm transition-colors",

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
 if TYPE_CHECKING:
+    from app.models.benchmark import BenchmarkResult
     from app.models.metric import Metric
     from app.models.tensor_artifact import TensorArtifact
 
@@ -27,4 +28,7 @@ class Run(Base):
     metrics: Mapped[list["Metric"]] = relationship("Metric", back_populates="run", cascade="all, delete-orphan")
     tensor_artifacts: Mapped[list["TensorArtifact"]] = relationship(
         "TensorArtifact", back_populates="run", cascade="all, delete-orphan"
+    )
+    benchmark_results: Mapped[list["BenchmarkResult"]] = relationship(
+        "BenchmarkResult", back_populates="run", cascade="all, delete-orphan"
     )

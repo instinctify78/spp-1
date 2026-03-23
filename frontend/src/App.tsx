@@ -4,6 +4,7 @@ import Layout from "@/components/Layout";
 import Dashboard from "@/pages/Dashboard";
 import NewRun from "@/pages/NewRun";
 import RunDetail from "@/pages/RunDetail";
+import Compare from "@/pages/Compare";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -23,6 +24,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/runs/new" element={<NewRun />} />
             <Route path="/runs/:id" element={<RunDetail />} />
+            <Route path="/compare" element={<Compare />} />
           </Routes>
         </Layout>
       </BrowserRouter>

@@ -17,7 +17,8 @@ export default defineConfig({
       "/runs":   { target: apiTarget, changeOrigin: true },
       "/system": { target: apiTarget, changeOrigin: true },
       "/health": { target: apiTarget, changeOrigin: true },
-      "/ws":     { target: apiTarget, changeOrigin: true, ws: true },
+      "/ws":      { target: apiTarget, changeOrigin: true, ws: true },
+      "/compare": { target: apiTarget, changeOrigin: true },
     },
   },
 });

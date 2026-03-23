@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import Base, engine
-from app.api import runs, system, stream, tensors
+from app.api import runs, system, stream, tensors, benchmarks, compare
 
 # Create all tables on startup (Alembic handles migrations in prod)
 Base.metadata.create_all(bind=engine)
@@ -21,6 +21,8 @@ app.include_router(runs.router, prefix="/runs", tags=["runs"])
 app.include_router(system.router, prefix="/system", tags=["system"])
 app.include_router(stream.router, tags=["stream"])
 app.include_router(tensors.router, prefix="/runs", tags=["tensors"])
+app.include_router(benchmarks.router, prefix="/runs", tags=["benchmarks"])
+app.include_router(compare.router, tags=["compare"])
 
 
 @app.get("/health")
