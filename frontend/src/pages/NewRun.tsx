@@ -22,6 +22,7 @@ export default function NewRun() {
   const [maxNewTokens, setMaxNewTokens] = useState(256);
   const [temperature, setTemperature] = useState(1.0);
   const [doSample, setDoSample] = useState(false);
+  const [captureLayers, setCaptureLayers] = useState("");
 
   const { mutate: createRun, isPending, error } = useMutation({
     mutationFn: runsApi.create,
@@ -38,6 +39,9 @@ export default function NewRun() {
       max_new_tokens: maxNewTokens,
       temperature,
       do_sample: doSample,
+      capture_layers: captureLayers
+        ? captureLayers.split(",").map((s) => s.trim()).filter(Boolean)
+        : [],
     });
   }
 
@@ -140,6 +144,21 @@ export default function NewRun() {
               onChange={(e) => setTemperature(Number(e.target.value))}
             />
           </div>
+        </div>
+
+        {/* Capture layers */}
+        <div className="space-y-1.5">
+          <Label htmlFor="capture_layers">Capture layers (optional)</Label>
+          <Input
+            id="capture_layers"
+            placeholder="e.g. transformer.h.0, transformer.h.11"
+            value={captureLayers}
+            onChange={(e) => setCaptureLayers(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Comma-separated layer names to capture activations for the heatmap.
+            For gpt2 try: <code className="bg-muted px-1 rounded">transformer.h.0, transformer.h.11</code>
+          </p>
         </div>
 
         {/* Sampling */}
