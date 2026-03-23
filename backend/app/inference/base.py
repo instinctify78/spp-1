@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Callable
 
 
 @dataclass
@@ -46,8 +47,16 @@ class InferenceBackend(ABC):
         """Load model weights onto the target device."""
 
     @abstractmethod
-    def generate(self, config: GenerationConfig) -> GenerationResult:
-        """Run generation and return the full result with metrics."""
+    def generate(
+        self,
+        config: GenerationConfig,
+        token_callback: Callable[[TokenEvent], None] | None = None,
+    ) -> GenerationResult:
+        """Run generation and return the full result with metrics.
+
+        token_callback, if provided, is called synchronously after each token
+        is generated. Safe to call from a background thread.
+        """
 
     @abstractmethod
     def unload_model(self) -> None:

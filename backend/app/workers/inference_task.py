@@ -1,5 +1,6 @@
-"""Celery task: run LLM inference and persist results to the database."""
+"""Inference runner — used both by the Celery task and the async background runner."""
 
+import asyncio
 from datetime import datetime, timezone
 
 from celery import Task
@@ -7,7 +8,7 @@ from celery.utils.log import get_task_logger
 
 from app.database import SessionLocal
 from app.inference.backend_factory import create_backend
-from app.inference.base import GenerationConfig
+from app.inference.base import GenerationConfig, TokenEvent
 from app.models.metric import Metric
 from app.models.run import Run
 from app.models.tensor_artifact import TensorArtifact
@@ -15,32 +16,34 @@ from app.workers.celery_app import celery_app
 
 logger = get_task_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Shared sync inference runner (used by both Celery task and async background)
+# ---------------------------------------------------------------------------
 
-class InferenceTask(Task):
-    """Base task class that holds a long-lived backend to avoid repeated model loads."""
-    abstract = True
-    _inference_backend = None   # named to avoid collision with Celery's Task._backend
-    _loaded_model_id = None
-    _loaded_device = None
-
-    def get_inference_backend(self, backend_type: str, model_id: str, device: str):
-        """Return a cached backend, reloading only if model or device changed."""
-        if (
-            self._inference_backend is None
-            or self._loaded_model_id != model_id
-            or self._loaded_device != device
-        ):
-            if self._inference_backend is not None:
-                self._inference_backend.unload_model()
-            self._inference_backend = create_backend(backend_type)
-            self._inference_backend.load_model(model_id, device)
-            self._loaded_model_id = model_id
-            self._loaded_device = device
-        return self._inference_backend
+# Module-level backend cache (shared across calls in the same process)
+_inference_backend = None
+_loaded_model_id = None
+_loaded_device = None
 
 
-@celery_app.task(bind=True, base=InferenceTask, name="inference.run")
-def run_inference(self: InferenceTask, run_id: int) -> dict:
+def _get_cached_backend(backend_type: str, model_id: str, device: str):
+    global _inference_backend, _loaded_model_id, _loaded_device
+    if (
+        _inference_backend is None
+        or _loaded_model_id != model_id
+        or _loaded_device != device
+    ):
+        if _inference_backend is not None:
+            _inference_backend.unload_model()
+        _inference_backend = create_backend(backend_type)
+        _inference_backend.load_model(model_id, device)
+        _loaded_model_id = model_id
+        _loaded_device = device
+    return _inference_backend
+
+
+def run_inference_sync(run_id: int, token_callback=None) -> None:
+    """Run inference synchronously. Safe to call from any thread."""
     db = SessionLocal()
     try:
         run = db.get(Run, run_id)
@@ -50,9 +53,9 @@ def run_inference(self: InferenceTask, run_id: int) -> dict:
         cfg = run.config
         run.status = "RUNNING"
         db.commit()
-        logger.info("Starting inference for run %d: model=%s device=%s", run_id, cfg["model_id"], cfg["device"])
+        logger.info("Starting inference run %d: model=%s device=%s", run_id, cfg["model_id"], cfg["device"])
 
-        backend = self.get_inference_backend(
+        backend = _get_cached_backend(
             backend_type=cfg.get("backend_type", "huggingface"),
             model_id=cfg["model_id"],
             device=cfg["device"],
@@ -68,25 +71,18 @@ def run_inference(self: InferenceTask, run_id: int) -> dict:
             capture_layers=cfg.get("capture_layers", []),
         )
 
-        result = backend.generate(gen_config)
+        result = backend.generate(gen_config, token_callback=token_callback)
 
-        # Persist aggregate metrics
-        aggregate_metrics = [
-            Metric(run_id=run_id, metric_type="ttft_ms", value=result.time_to_first_token_ms),
+        db.add_all([
+            Metric(run_id=run_id, metric_type="ttft_ms",          value=result.time_to_first_token_ms),
             Metric(run_id=run_id, metric_type="total_latency_ms", value=result.total_latency_ms),
-            Metric(run_id=run_id, metric_type="throughput_tps", value=result.throughput_tps),
-            Metric(run_id=run_id, metric_type="peak_memory_mb", value=result.peak_memory_mb),
-            Metric(run_id=run_id, metric_type="num_tokens", value=result.num_tokens),
-        ]
-        db.add_all(aggregate_metrics)
+            Metric(run_id=run_id, metric_type="throughput_tps",   value=result.throughput_tps),
+            Metric(run_id=run_id, metric_type="peak_memory_mb",   value=result.peak_memory_mb),
+            Metric(run_id=run_id, metric_type="num_tokens",       value=result.num_tokens),
+        ])
 
-        # Persist tensor artifacts
         for layer_name, file_path in result.tensor_artifacts.items():
-            db.add(TensorArtifact(
-                run_id=run_id,
-                layer_name=layer_name,
-                file_path=file_path,
-            ))
+            db.add(TensorArtifact(run_id=run_id, layer_name=layer_name, file_path=file_path))
 
         run.status = "COMPLETED"
         run.finished_at = datetime.now(timezone.utc)
@@ -94,10 +90,9 @@ def run_inference(self: InferenceTask, run_id: int) -> dict:
         db.commit()
 
         logger.info(
-            "Run %d completed: %d tokens, %.1f tps, %.1f ms latency",
+            "Run %d completed: %d tokens, %.1f tps, %.1f ms",
             run_id, result.num_tokens, result.throughput_tps, result.total_latency_ms,
         )
-        return {"run_id": run_id, "status": "COMPLETED", "num_tokens": result.num_tokens}
 
     except Exception as exc:
         logger.exception("Run %d failed: %s", run_id, exc)
@@ -111,3 +106,42 @@ def run_inference(self: InferenceTask, run_id: int) -> dict:
 
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Async background runner (used by POST /runs for streaming)
+# ---------------------------------------------------------------------------
+
+async def run_inference_background(run_id: int) -> None:
+    """Async wrapper: runs sync inference in a thread, streams tokens via queue."""
+    import app.streaming as streaming
+
+    loop = asyncio.get_event_loop()
+    queue = streaming.get_queue(run_id)
+
+    def token_callback(event: TokenEvent) -> None:
+        if queue is not None:
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {"type": "token", "token": event.token, "step": event.step, "elapsed_ms": event.elapsed_ms},
+            )
+
+    try:
+        await asyncio.to_thread(run_inference_sync, run_id, token_callback)
+    finally:
+        if queue is not None:
+            loop.call_soon_threadsafe(queue.put_nowait, {"type": "done"})
+
+
+# ---------------------------------------------------------------------------
+# Celery task (kept for future Redis/worker mode)
+# ---------------------------------------------------------------------------
+
+class InferenceTask(Task):
+    abstract = True
+
+
+@celery_app.task(bind=True, base=InferenceTask, name="inference.run")
+def run_inference(self: InferenceTask, run_id: int) -> dict:
+    run_inference_sync(run_id)
+    return {"run_id": run_id, "status": "COMPLETED"}

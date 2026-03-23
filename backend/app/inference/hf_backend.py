@@ -1,14 +1,16 @@
 """HuggingFace Transformers inference backend.
 
 Supports any AutoModelForCausalLM-compatible model on cuda / mps / cpu.
-Tensor capture is done via PyTorch forward hooks (see collectors/tensor_hooks.py).
-Note: token-level streaming is added in Phase 3 via WebSockets.
+Uses a manual token-by-token generation loop so each token can be streamed
+to the WebSocket via token_callback before the full result is returned.
 """
 
 import time
 from pathlib import Path
+from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from app.collectors.memory import get_peak_memory_mb, reset_memory_stats
@@ -38,12 +40,17 @@ class HFBackend(InferenceBackend):
         ).to(device)
         self._model.eval()
 
-    def generate(self, config: GenerationConfig) -> GenerationResult:
+    def generate(
+        self,
+        config: GenerationConfig,
+        token_callback: Callable[[TokenEvent], None] | None = None,
+    ) -> GenerationResult:
         if self._model is None or self._tokenizer is None:
             self.load_model(config.model_id, config.device)
 
         inputs = self._tokenizer(config.prompt, return_tensors="pt").to(self._device)
-        prompt_len = inputs["input_ids"].shape[1]
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
 
         # Attach tensor capture hooks if requested
         artifact_dir = Path(settings.data_dir) / "tensors"
@@ -53,37 +60,54 @@ class HFBackend(InferenceBackend):
             hook.attach(self._model)
 
         reset_memory_stats(self._device)
+
+        eos_id = self._tokenizer.eos_token_id
+        token_events: list[TokenEvent] = []
+        ttft_ms: float = 0.0
         t_start = time.perf_counter()
 
-        with torch.no_grad():
-            output_ids = self._model.generate(
-                **inputs,
-                max_new_tokens=config.max_new_tokens,
-                temperature=config.temperature,
-                do_sample=config.do_sample,
+        generated_ids = input_ids
+
+        for step in range(config.max_new_tokens):
+            with torch.no_grad():
+                outputs = self._model(generated_ids, attention_mask=attention_mask)
+
+            logits = outputs.logits[:, -1, :]  # [1, vocab_size]
+
+            if config.do_sample and config.temperature > 0:
+                logits = logits / config.temperature
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            token_id = next_token[0, 0].item()
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+
+            if step == 0:
+                ttft_ms = elapsed_ms
+
+            token_str = self._tokenizer.decode([token_id], skip_special_tokens=True)
+            event = TokenEvent(token=token_str, token_id=token_id, step=step, elapsed_ms=elapsed_ms)
+            token_events.append(event)
+
+            if token_callback is not None:
+                token_callback(event)
+
+            if token_id == eos_id:
+                break
+
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones((1, 1), device=self._device, dtype=attention_mask.dtype)],
+                dim=1,
             )
 
         total_latency_ms = (time.perf_counter() - t_start) * 1000
         peak_memory_mb = get_peak_memory_mb(self._device)
         tensor_artifacts = hook.detach() if config.capture_layers else {}
 
-        # Decode only the newly generated tokens (exclude prompt)
-        new_ids = output_ids[0][prompt_len:]
-        full_text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
-        num_tokens = len(new_ids)
-
-        # Build per-token events with estimated elapsed time (linear interpolation)
-        token_events: list[TokenEvent] = []
-        for step, token_id in enumerate(new_ids.tolist()):
-            elapsed_ms = total_latency_ms * (step + 1) / num_tokens if num_tokens > 0 else 0
-            token_events.append(TokenEvent(
-                token=self._tokenizer.decode([token_id], skip_special_tokens=True),
-                token_id=token_id,
-                step=step,
-                elapsed_ms=elapsed_ms,
-            ))
-
-        ttft_ms = token_events[0].elapsed_ms if token_events else 0.0
+        full_text = "".join(e.token for e in token_events)
 
         return GenerationResult(
             text=full_text,
@@ -92,7 +116,7 @@ class HFBackend(InferenceBackend):
             time_to_first_token_ms=ttft_ms,
             total_latency_ms=total_latency_ms,
             peak_memory_mb=peak_memory_mb,
-            num_tokens=num_tokens,
+            num_tokens=len(token_events),
         )
 
     def unload_model(self) -> None:
